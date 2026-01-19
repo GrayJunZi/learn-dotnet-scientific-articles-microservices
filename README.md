@@ -2539,3 +2539,2374 @@ public class UploadManuscriptFileCommandHandler(
 - **依赖注入**：便于测试和维护
 
 这个文件存储模块为科学文章管理系统提供了可靠、高性能的文件存储能力，支持大文件上传和下载，满足了科学文章管理的需求。
+
+## 四、微服务 Auth 与 FastEndpoints、JWT认证 & Role-Based Access Control
+
+### 4.1 认证流程、用户故事与接口设计
+
+#### 4.1.1 认证流程(Auth Workflow)
+
+1. 管理员创建一个账户并分配角色
+2. 系统会发送一封确认邮件以验证用户身份。
+3. 账户一经确认，用户即可使用其凭据登录。
+4. 用户必须确认其账户并设置密码，然后才允许登录。
+5. 登录期间，系统会生成一个短期的访问令牌(用于验证请求的JWT)，同时会生成一个长期 的刷新令牌。
+6. 当访问令牌过期时，用户可以使用刷新令牌获取新的访问令牌，而无需重新登录。
+
+身份验证服务负责处理认证与授权，颁发访问令牌和刷新令牌，实施基于角色的访问控制，并且是系统中所有其他服务所依赖的核心组件。
+
+#### 4.1.2 用户故事(User Stories)
+
+1. 创建用户
+    - 作为管理员，我想创建一个新用户账户，以便为其分配角色和权限。
+    - 系统会发送一封确认邮件，用户需要点击链接确认账户。
+    - 账户确认后，用户即可使用其凭据登录。 
+2. 设置密码
+    - 作为用户，确认邮件包含一个设置密码的安全链接。
+    - 用户点击链接，进入设置密码页面。
+    - 用户输入新密码并确认，密码设置成功。
+3. 重置密码
+    - 作为用户，我想重置我的密码，以便在忘记密码时能够登录。
+    - 系统会发送一封包含重置密码安全链接的邮件给用户。
+    - 用户点击链接，进入重置密码页面。
+    - 用户输入新密码并确认，密码重置成功。
+4. 登录
+    - 作为用户，登录后系统会返回一个访问令牌和刷新令牌。
+    - 访问令牌用于验证后续请求，刷新令牌用于获取新的访问令牌。
+5. 刷新访问令牌
+    - 当访问令牌过期时，用户可以使用刷新令牌获取新的访问令牌。
+    - 刷新令牌也有过期时间，过期后需要重新登录获取新的刷新令牌。
+6. 获取用户信息
+    - 作为服务，系统中的某些服务需要获取当前登录用户的信息，例如显示姓名、检查角色或发送电子邮件。
+    - 这些服务可以通过访问令牌中的用户ID来获取用户信息。
+
+#### 4.1.3 接口设计(API Endpoints)
+
+| 接口名称    | 请求方式 | 角色   | 接口路由                          |
+| ---------- | ------- | ----- | -------------------------------- |
+| 创建用户    | POST    | ADMIN | /api/users                       |
+| 设置密码    | POST    | USER  | /api/password                    |
+| 重置密码    | POST    | USER  | /api/password:reset              |
+| 用户登录    | POST    | USER  | /api/login                       |
+| 刷新访问令牌 | POST    | USER  | /api/token:refresh               |
+| 获取用户信息 | gRPC    | SYSTEM | UserService.GetUserById(userId) |
+
+### 4.2.1 需求、功能、性能和安全
+
+- 功能性需求：
+    1. 创建用户
+    2. 设置密码
+    3. 重置密码
+    4. 登录
+    5. 刷新令牌
+    6. 获取用户信息
+- 非功能性需求：
+    1. 身份认证
+        - Token类型： JWT(Access + Refresh)
+        - 过期时间：Access 15分钟，Refresh 7天
+    2. 密码管理
+        - 存储：使用 ASP.NET Core Identity
+        - 要求：至少8个字符、1个大写字母、1个数字、1个特殊字符
+    3. 安全
+        - 基于角色的权限访问控制
+        - 部分接口允许匿名访问
+    4. 可扩展性
+        - 水平扩展：能够在需要时添加更多实例
+        - 无状态接口：每个请求都包含所有必要的信息，服务器不存储会话状态。
+    5. 性能
+        - 响应时间：登录和生成令牌时间应在200ms以内。
+        - gRPC响应时间应在100ms以内。
+
+### 4.3 身份认证与鉴权流程
+
+1. 用户通过身份认证服务登录，收到一个JWT令牌，然后使用该令牌访问其他服务中受保护的接口。
+2. 其他服务收到请求后，会验证JWT令牌的有效性。
+    - 检查令牌是否过期。
+    - 验证令牌签名是否正确。
+    - 检查令牌中包含的用户角色是否有权限访问该接口。
+3. 如果令牌验证通过，服务会处理请求并返回响应。
+    - 如果令牌验证失败，服务会返回401 Unauthorized错误。
+
+### 4.4 基于JWT令牌的单点登录跨服务认证
+
+#### 4.4.1 JWT令牌基础概念
+
+JSON Web Token (JWT) 是一种开放标准 (RFC 7519)，用于在各方之间安全地传输信息。JWT 由三部分组成：
+
+1. **Header (头部)**：包含令牌类型和签名算法
+```json
+{
+  "alg": "HS256",
+  "typ": "JWT"
+}
+```
+
+2. **Payload (载荷)**：包含声明（Claims），如用户信息、角色、过期时间等
+```json
+{
+  "sub": "1234567890",
+  "name": "John Doe",
+  "role": "Author",
+  "exp": 1516239022
+}
+```
+
+3. **Signature (签名)**：用于验证令牌的完整性
+```
+HMACSHA256(
+  base64UrlEncode(header) + "." +
+  base64UrlEncode(payload),
+  secret)
+```
+
+#### 4.4.2 访问令牌与刷新令牌
+
+**访问令牌 (Access Token)**
+- 有效期短（通常15分钟）
+- 用于访问受保护的资源
+- 包含用户身份和权限信息
+- 存储在客户端内存中
+
+**刷新令牌 (Refresh Token)**
+- 有效期长（通常7天）
+- 用于获取新的访问令牌
+- 仅包含用户ID和令牌ID
+- 存储在HttpOnly Cookie中，防止XSS攻击
+
+#### 4.4.3 单点登录实现原理
+
+单点登录（Single Sign-On, SSO）允许用户使用一组凭据登录多个应用程序。在我们的系统中：
+
+1. 用户在身份认证服务登录
+2. 系统验证凭据并颁发JWT令牌
+3. 用户使用JWT令牌访问其他微服务
+4. 每个微服务独立验证JWT令牌
+5. 无需在每个服务中维护会话状态
+
+#### 4.4.4 跨服务认证流程
+
+```
+用户 → 网关 → 投稿服务 → 验证JWT → 处理请求
+         ↓
+      提交JWT
+```
+
+**认证流程详细步骤**：
+
+1. **用户登录**
+   - 用户提交用户名和密码
+   - 身份认证服务验证凭据
+   - 生成访问令牌和刷新令牌
+   - 返回令牌给客户端
+
+2. **访问受保护资源**
+   - 客户端在请求头中携带访问令牌：`Authorization: Bearer {access_token}`
+   - 网关将请求路由到目标微服务
+   - 微服务验证JWT令牌的有效性
+   - 验证通过后处理请求
+
+3. **令牌刷新**
+   - 访问令牌过期时，客户端使用刷新令牌申请新令牌
+   - 身份认证服务验证刷新令牌
+   - 颁发新的访问令牌
+   - 可选地颁发新的刷新令牌
+
+#### 4.4.5 JWT令牌生成实现
+
+```csharp
+// Auth.Application/Features/Login/GenerateToken.cs
+public static class GenerateToken
+{
+    public static (string AccessToken, string RefreshToken) Generate(
+        User user,
+        IConfiguration configuration)
+    {
+        var jwtSettings = configuration.GetSection("JwtSettings");
+        var secretKey = jwtSettings["SecretKey"];
+        var issuer = jwtSettings["Issuer"];
+        var audience = jwtSettings["Audience"];
+        var accessTokenExpirationMinutes = int.Parse(jwtSettings["AccessTokenExpirationMinutes"]);
+        var refreshTokenExpirationDays = int.Parse(jwtSettings["RefreshTokenExpirationDays"]);
+
+        // 生成访问令牌
+        var accessToken = GenerateAccessToken(
+            user,
+            secretKey,
+            issuer,
+            audience,
+            accessTokenExpirationMinutes);
+
+        // 生成刷新令牌
+        var refreshToken = GenerateRefreshToken();
+
+        return (accessToken, refreshToken);
+    }
+
+    private static string GenerateAccessToken(
+        User user,
+        string secretKey,
+        string issuer,
+        string audience,
+        int expirationMinutes)
+    {
+        var claims = new List<Claim>
+        {
+            new Claim(JwtRegisteredClaimNames.Sub, user.Id.ToString()),
+            new Claim(JwtRegisteredClaimNames.Email, user.Email),
+            new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+            new Claim(ClaimTypes.Name, user.FullName),
+            new Claim(ClaimTypes.Role, user.Role.ToString())
+        };
+
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secretKey));
+        var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+        var token = new JwtSecurityToken(
+            issuer: issuer,
+            audience: audience,
+            claims: claims,
+            expires: DateTime.UtcNow.AddMinutes(expirationMinutes),
+            signingCredentials: credentials
+        );
+
+        return new JwtSecurityTokenHandler().WriteToken(token);
+    }
+
+    private static string GenerateRefreshToken()
+    {
+        var randomNumber = new byte[32];
+        using var rng = RandomNumberGenerator.Create();
+        rng.GetBytes(randomNumber);
+        return Convert.ToBase64String(randomNumber);
+    }
+}
+```
+
+#### 4.4.6 JWT令牌验证中间件
+
+```csharp
+// BuildingBlocks.AspNetCore/JwtAuthenticationMiddleware.cs
+public class JwtAuthenticationMiddleware(RequestDelegate next)
+{
+    public async Task InvokeAsync(HttpContext context)
+    {
+        var authHeader = context.Request.Headers["Authorization"].FirstOrDefault();
+
+        if (authHeader != null && authHeader.StartsWith("Bearer "))
+        {
+            var token = authHeader.Substring("Bearer ".Length).Trim();
+            var principal = ValidateToken(token);
+
+            if (principal != null)
+            {
+                context.User = principal;
+            }
+        }
+
+        await next(context);
+    }
+
+    private static ClaimsPrincipal ValidateToken(string token)
+    {
+        try
+        {
+            var tokenHandler = new JwtSecurityTokenHandler();
+            var key = Encoding.UTF8.GetBytes("your-secret-key-here");
+
+            var validationParameters = new TokenValidationParameters
+            {
+                ValidateIssuer = true,
+                ValidateAudience = true,
+                ValidateLifetime = true,
+                ValidateIssuerSigningKey = true,
+                ValidIssuer = "your-issuer",
+                ValidAudience = "your-audience",
+                IssuerSigningKey = new SymmetricSecurityKey(key),
+                ClockSkew = TimeSpan.Zero
+            };
+
+            return tokenHandler.ValidateToken(token, validationParameters, out _);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}
+```
+
+#### 4.4.7 配置JWT认证
+
+```csharp
+// Auth.API/DependencyInjection.cs
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+})
+.AddJwtBearer(options =>
+{
+    var jwtSettings = configuration.GetSection("JwtSettings");
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuer = true,
+        ValidateAudience = true,
+        ValidateLifetime = true,
+        ValidateIssuerSigningKey = true,
+        ValidIssuer = jwtSettings["Issuer"],
+        ValidAudience = jwtSettings["Audience"],
+        IssuerSigningKey = new SymmetricSecurityKey(
+            Encoding.UTF8.GetBytes(jwtSettings["SecretKey"])),
+        ClockSkew = TimeSpan.Zero
+    };
+});
+
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("AdminOnly", policy => policy.RequireRole("Admin"));
+    options.AddPolicy("UserOnly", policy => policy.RequireRole("User", "Admin"));
+});
+```
+
+#### 4.4.8 配置文件示例
+
+```json
+{
+  "JwtSettings": {
+    "SecretKey": "your-very-long-secret-key-at-least-32-characters-long",
+    "Issuer": "https://auth.yourdomain.com",
+    "Audience": "https://api.yourdomain.com",
+    "AccessTokenExpirationMinutes": 15,
+    "RefreshTokenExpirationDays": 7
+  }
+}
+```
+
+#### 4.4.9 设计优势
+
+- **无状态性**：服务器不需要存储会话状态，便于水平扩展
+- **跨域支持**：JWT令牌可以在不同域之间传递
+- **安全性**：令牌签名确保数据完整性，过期时间增强安全性
+- **性能**：减少数据库查询，提高响应速度
+- **灵活性**：可以在令牌中携带自定义声明
+- **标准化**：基于开放标准，便于集成第三方工具
+
+#### 4.4.10 安全最佳实践
+
+1. **密钥管理**：使用强密钥，定期轮换
+2. **HTTPS传输**：始终使用HTTPS传输令牌
+3. **令牌过期**：设置合理的过期时间
+4. **刷新令牌存储**：使用HttpOnly Cookie存储刷新令牌
+5. **令牌撤销**：实现令牌黑名单机制
+6. **声明最小化**：只在令牌中包含必要的声明
+
+### 4.5 聚合 实体、值对象、领域事件
+
+#### 4.5.1 DDD战术设计概述
+
+领域驱动设计（DDD）的战术设计提供了一套建模工具，帮助我们构建丰富的领域模型。核心概念包括：
+
+- **聚合（Aggregate）**：定义了一致性边界，是一组相关对象的集合
+- **实体（Entity）**：具有唯一标识的对象，标识符不变但属性可变
+- **值对象（Value Object）**：通过属性值定义的对象，不可变且可替换
+- **领域事件（Domain Event）**：表示领域内发生的重要业务事件
+
+#### 4.5.2 聚合（Aggregate）
+
+**聚合的定义**
+
+聚合是一组相关领域对象的集合，它们作为一个整体进行操作和维护一致性。聚合根（Aggregate Root）是聚合的唯一入口点，外部只能通过聚合根访问聚合内部的对象。
+
+**聚合的设计原则**
+
+1. **一致性边界**：聚合确保内部对象始终保持一致的状态
+2. **单一根**：每个聚合只有一个聚合根
+3. **外部引用**：聚合只能通过ID引用其他聚合
+4. **事务边界**：一个事务只能修改一个聚合
+5. **最小化聚合**：聚合应该尽可能小，以提高性能
+
+**用户聚合示例**
+
+```csharp
+// Auth.Domain/Aggregates/User.cs
+public class User : Entity<int>, IAggregateRoot
+{
+    private readonly List<RefreshToken> _refreshTokens = new();
+    private readonly List<UserRole> _userRoles = new();
+
+    public string Email { get; private set; }
+    public string FullName { get; private set; }
+    public string PasswordHash { get; private set; }
+    public bool IsEmailConfirmed { get; private set; }
+    public DateTime CreatedAt { get; private set; }
+    public DateTime? LastLoginAt { get; private set; }
+
+    public IReadOnlyCollection<RefreshToken> RefreshTokens => _refreshTokens.AsReadOnly();
+    public IReadOnlyCollection<UserRole> UserRoles => _userRoles.AsReadOnly();
+
+    private User() { }
+
+    public static User Create(string email, string fullName, string passwordHash)
+    {
+        Guard.ThrowIfNullOrWhiteSpace(email);
+        Guard.ThrowIfNullOrWhiteSpace(fullName);
+        Guard.ThrowIfNullOrWhiteSpace(passwordHash);
+
+        var user = new User
+        {
+            Email = email,
+            FullName = fullName,
+            PasswordHash = passwordHash,
+            IsEmailConfirmed = false,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        user.AddDomainEvent(new UserCreatedEvent(user.Id, user.Email));
+
+        return user;
+    }
+
+    public void ConfirmEmail()
+    {
+        if (IsEmailConfirmed)
+            throw new DomainException("Email is already confirmed.");
+
+        IsEmailConfirmed = true;
+        AddDomainEvent(new EmailConfirmedEvent(Id, Email));
+    }
+
+    public void UpdatePassword(string newPasswordHash)
+    {
+        Guard.ThrowIfNullOrWhiteSpace(newPasswordHash);
+        PasswordHash = newPasswordHash;
+        AddDomainEvent(new PasswordUpdatedEvent(Id));
+    }
+
+    public void RecordLogin()
+    {
+        LastLoginAt = DateTime.UtcNow;
+    }
+
+    public void AddRefreshToken(RefreshToken refreshToken)
+    {
+        _refreshTokens.Add(refreshToken);
+        AddDomainEvent(new RefreshTokenAddedEvent(Id, refreshToken.Token));
+    }
+
+    public void RevokeRefreshToken(string token)
+    {
+        var refreshToken = _refreshTokens.FirstOrDefault(rt => rt.Token == token);
+        if (refreshToken is null)
+            throw new NotFoundException("Refresh token not found.");
+
+        refreshToken.Revoke();
+        AddDomainEvent(new RefreshTokenRevokedEvent(Id, token));
+    }
+
+    public void AssignRole(UserRole role)
+    {
+        if (_userRoles.Any(ur => ur.RoleId == role.RoleId))
+            throw new DomainException("User already has this role.");
+
+        _userRoles.Add(role);
+        AddDomainEvent(new RoleAssignedEvent(Id, role.RoleId));
+    }
+
+    public void RemoveRole(int roleId)
+    {
+        var role = _userRoles.FirstOrDefault(ur => ur.RoleId == roleId);
+        if (role is null)
+            throw new NotFoundException("Role not found.");
+
+        _userRoles.Remove(role);
+        AddDomainEvent(new RoleRemovedEvent(Id, roleId));
+    }
+
+    public bool HasRole(string roleName)
+    {
+        return _userRoles.Any(ur => ur.Role.Name == roleName);
+    }
+
+    public bool IsValidRefreshToken(string token)
+    {
+        return _refreshTokens.Any(rt => rt.Token == token && !rt.IsRevoked && rt.ExpiryDate > DateTime.UtcNow);
+    }
+}
+```
+
+#### 4.5.3 实体（Entity）
+
+**实体的特征**
+
+1. **唯一标识**：每个实体都有唯一的标识符，标识符在生命周期内不变
+2. **可变性**：实体的属性可以变化，但标识符不变
+3. **生命周期**：实体有明确的生命周期，可以被创建、修改和删除
+4. **相等性**：两个实体相等当且仅当它们的标识符相等
+
+**实体基类实现**
+
+```csharp
+// BuildingBlocks.Domain/Entity.cs
+public abstract class Entity<TId> : IEntity<TId>
+{
+    public TId Id { get; protected set; }
+    private readonly List<DomainEvent> _domainEvents = new();
+
+    public IReadOnlyCollection<DomainEvent> DomainEvents => _domainEvents.AsReadOnly();
+
+    protected Entity() { }
+
+    protected Entity(TId id)
+    {
+        Id = id;
+    }
+
+    protected void AddDomainEvent(DomainEvent domainEvent)
+    {
+        _domainEvents.Add(domainEvent);
+    }
+
+    public void ClearDomainEvents()
+    {
+        _domainEvents.Clear();
+    }
+
+    public override bool Equals(object? obj)
+    {
+        if (obj is not Entity<TId> other)
+            return false;
+
+        if (ReferenceEquals(this, other))
+            return true;
+
+        if (GetType() != other.GetType())
+            return false;
+
+        if (Id is null || other.Id is null)
+            return false;
+
+        return Id.Equals(other.Id);
+    }
+
+    public override int GetHashCode()
+    {
+        return Id?.GetHashCode() ?? 0;
+    }
+
+    public static bool operator ==(Entity<TId>? left, Entity<TId>? right)
+    {
+        if (left is null && right is null)
+            return true;
+
+        if (left is null || right is null)
+            return false;
+
+        return left.Equals(right);
+    }
+
+    public static bool operator !=(Entity<TId>? left, Entity<TId>? right)
+    {
+        return !(left == right);
+    }
+}
+```
+
+**RefreshToken 实体示例**
+
+```csharp
+// Auth.Domain/Entities/RefreshToken.cs
+public class RefreshToken : Entity<string>
+{
+    public int UserId { get; private set; }
+    public DateTime CreatedAt { get; private set; }
+    public DateTime ExpiryDate { get; private set; }
+    public bool IsRevoked { get; private set; }
+    public DateTime? RevokedAt { get; private set; }
+    public string? RevokedReason { get; private set; }
+
+    private RefreshToken() { }
+
+    public static RefreshToken Create(int userId, string token, int expiryDays)
+    {
+        return new RefreshToken
+        {
+            Id = token,
+            UserId = userId,
+            CreatedAt = DateTime.UtcNow,
+            ExpiryDate = DateTime.UtcNow.AddDays(expiryDays),
+            IsRevoked = false
+        };
+    }
+
+    public void Revoke(string? reason = null)
+    {
+        if (IsRevoked)
+            throw new DomainException("Refresh token is already revoked.");
+
+        IsRevoked = true;
+        RevokedAt = DateTime.UtcNow;
+        RevokedReason = reason;
+    }
+
+    public bool IsActive => !IsRevoked && ExpiryDate > DateTime.UtcNow;
+}
+```
+
+#### 4.5.4 值对象（Value Object）
+
+**值对象的特征**
+
+1. **不可变性**：值对象创建后不能修改
+2. **基于值相等**：两个值对象相等当且仅当所有属性值相等
+3. **无标识**：值对象没有唯一标识符
+4. **可替换性**：可以完全替换一个值对象而不影响业务逻辑
+
+**值对象的优势**
+
+- **简化代码**：减少对标识符的依赖
+- **提高性能**：可以安全地缓存和共享
+- **增强可读性**：通过类型表达业务概念
+- **减少错误**：编译时类型检查
+
+**Email 值对象示例**
+
+```csharp
+// Auth.Domain/ValueObjects/Email.cs
+public class Email : ValueObject
+{
+    public string Value { get; }
+
+    private Email(string value)
+    {
+        Value = value;
+    }
+
+    public static Email Create(string value)
+    {
+        Guard.ThrowIfNullOrWhiteSpace(value);
+
+        if (!IsValidEmail(value))
+            throw new DomainException($"Invalid email address: {value}");
+
+        return new Email(value.ToLowerInvariant().Trim());
+    }
+
+    private static bool IsValidEmail(string email)
+    {
+        const string pattern = @"^[^@\s]+@[^@\s]+\.[^@\s]+$";
+        return Regex.IsMatch(email, pattern, RegexOptions.IgnoreCase);
+    }
+
+    protected override IEnumerable<object?> GetEqualityComponents()
+    {
+        yield return Value;
+    }
+
+    public static implicit operator string(Email email) => email.Value;
+
+    public override string ToString() => Value;
+}
+```
+
+**值对象基类实现**
+
+```csharp
+// BuildingBlocks.Domain/ValueObject.cs
+public abstract class ValueObject : IEquatable<ValueObject>
+{
+    protected abstract IEnumerable<object?> GetEqualityComponents();
+
+    public bool Equals(ValueObject? other)
+    {
+        if (other is null)
+            return false;
+
+        if (ReferenceEquals(this, other))
+            return true;
+
+        if (GetType() != other.GetType())
+            return false;
+
+        return GetEqualityComponents().SequenceEqual(other.GetEqualityComponents());
+    }
+
+    public override bool Equals(object? obj)
+    {
+        return Equals(obj as ValueObject);
+    }
+
+    public override int GetHashCode()
+    {
+        return GetEqualityComponents()
+            .Select(x => x?.GetHashCode() ?? 0)
+            .Aggregate((x, y) => x ^ y);
+    }
+
+    public static bool operator ==(ValueObject? left, ValueObject? right)
+    {
+        if (left is null && right is null)
+            return true;
+
+        if (left is null || right is null)
+            return false;
+
+        return left.Equals(right);
+    }
+
+    public static bool operator !=(ValueObject? left, ValueObject? right)
+    {
+        return !(left == right);
+    }
+}
+```
+
+#### 4.5.5 领域事件（Domain Event）
+
+**领域事件的用途**
+
+1. **解耦业务逻辑**：通过事件驱动的方式解耦不同的业务操作
+2. **实现最终一致性**：在分布式系统中保持数据的一致性
+3. **审计和追踪**：记录重要的业务操作
+4. **触发副作用**：在业务操作完成后执行其他操作
+
+**领域事件基类实现**
+
+```csharp
+// BuildingBlocks.Domain/DomainEvent.cs
+public abstract class DomainEvent : INotification
+{
+    public DateTime OccurredOn { get; } = DateTime.UtcNow;
+    public string EventType => GetType().Name;
+}
+```
+
+**用户相关领域事件示例**
+
+```csharp
+// Auth.Domain/Events/UserCreatedEvent.cs
+public class UserCreatedEvent : DomainEvent
+{
+    public int UserId { get; }
+    public string Email { get; }
+
+    public UserCreatedEvent(int userId, string email)
+    {
+        UserId = userId;
+        Email = email;
+    }
+}
+
+// Auth.Domain/Events/EmailConfirmedEvent.cs
+public class EmailConfirmedEvent : DomainEvent
+{
+    public int UserId { get; }
+    public string Email { get; }
+
+    public EmailConfirmedEvent(int userId, string email)
+    {
+        UserId = userId;
+        Email = email;
+    }
+}
+
+// Auth.Domain/Events/PasswordUpdatedEvent.cs
+public class PasswordUpdatedEvent : DomainEvent
+{
+    public int UserId { get; }
+
+    public PasswordUpdatedEvent(int userId)
+    {
+        UserId = userId;
+    }
+}
+
+// Auth.Domain/Events/RefreshTokenAddedEvent.cs
+public class RefreshTokenAddedEvent : DomainEvent
+{
+    public int UserId { get; }
+    public string Token { get; }
+
+    public RefreshTokenAddedEvent(int userId, string token)
+    {
+        UserId = userId;
+        Token = token;
+    }
+}
+
+// Auth.Domain/Events/RoleAssignedEvent.cs
+public class RoleAssignedEvent : DomainEvent
+{
+    public int UserId { get; }
+    public int RoleId { get; }
+
+    public RoleAssignedEvent(int userId, int roleId)
+    {
+        UserId = userId;
+        RoleId = roleId;
+    }
+}
+```
+
+#### 4.5.6 领域事件派发器
+
+```csharp
+// BuildingBlocks.EntityFramework/DomainEventDispatcher.cs
+public class DomainEventDispatcher(IPublisher publisher) : ISaveChangesInterceptor
+{
+    public async ValueTask<InterceptionResult<int>> SavingChangesAsync(
+        DbContextEventData eventData,
+        InterceptionResult<int> result,
+        CancellationToken cancellationToken = default)
+    {
+        var dbContext = eventData.Context;
+        var entities = dbContext.ChangeTracker
+            .Entries<Entity<int>>()
+            .Where(e => e.Entity.DomainEvents.Any())
+            .Select(e => e.Entity);
+
+        var domainEvents = entities
+            .SelectMany(e => e.DomainEvents)
+            .ToList();
+
+        entities.ToList().ForEach(e => e.ClearDomainEvents());
+
+        foreach (var domainEvent in domainEvents)
+        {
+            await publisher.Publish(domainEvent, cancellationToken);
+        }
+
+        return result;
+    }
+}
+```
+
+#### 4.5.7 领域事件处理器示例
+
+```csharp
+// Auth.Application/Events/UserCreatedEventHandler.cs
+public class UserCreatedEventHandler(
+    IEmailService emailService,
+    ILogger<UserCreatedEventHandler> logger) : INotificationHandler<UserCreatedEvent>
+{
+    public async Task Handle(UserCreatedEvent notification, CancellationToken cancellationToken)
+    {
+        logger.LogInformation("Handling UserCreatedEvent for user {UserId}", notification.UserId);
+
+        var confirmationLink = GenerateConfirmationLink(notification.UserId);
+        await emailService.SendEmailConfirmationAsync(
+            notification.Email,
+            confirmationLink,
+            cancellationToken);
+
+        logger.LogInformation("Confirmation email sent to {Email}", notification.Email);
+    }
+
+    private static string GenerateConfirmationLink(int userId)
+    {
+        var token = GenerateSecureToken();
+        return $"https://auth.yourdomain.com/confirm-email?userId={userId}&token={token}";
+    }
+
+    private static string GenerateSecureToken()
+    {
+        var randomNumber = new byte[32];
+        using var rng = RandomNumberGenerator.Create();
+        rng.GetBytes(randomNumber);
+        return Convert.ToBase64String(randomNumber);
+    }
+}
+```
+
+#### 4.5.8 DDD战术设计最佳实践
+
+**聚合设计**
+- 保持聚合尽可能小
+- 确保聚合内的业务规则得到强制执行
+- 通过聚合根控制所有对聚合的访问
+- 避免聚合之间的直接引用
+
+**实体设计**
+- 使用有意义的标识符
+- 封装业务逻辑在实体内部
+- 确保实体的不变性约束
+- 使用领域语言命名实体和属性
+
+**值对象设计**
+- 优先使用值对象而不是基本类型
+- 确保值对象的不可变性
+- 为值对象提供验证逻辑
+- 重写相等性比较方法
+
+**领域事件设计**
+- 使用过去时态命名事件
+- 事件应该包含必要的上下文信息
+- 避免在事件中包含敏感信息
+- 事件应该是不可变的
+
+#### 4.5.9 设计优势
+
+- **业务逻辑封装**：将业务规则封装在领域模型中
+- **代码可读性**：使用领域语言提高代码可读性
+- **可测试性**：领域模型易于单元测试
+- **可维护性**：清晰的边界和职责分离
+- **可扩展性**：易于添加新的业务规则
+- **一致性保证**：聚合确保数据一致性
+
+### 4.6 创建用户:用FluentValidation实现命令与逻辑
+
+#### 4.6.1 FluentValidation 概述
+
+FluentValidation 是一个 .NET 库，用于使用流畅的接口构建强类型的验证规则。它提供了以下优势：
+
+- **强类型验证**：编译时类型检查，减少运行时错误
+- **可读性强**：流畅的接口使验证规则易于理解
+- **可重用性**：验证器可以在多个地方重用
+- **分离关注点**：将验证逻辑与业务逻辑分离
+- **丰富的验证规则**：内置多种验证规则，支持自定义验证
+- **国际化支持**：支持多语言错误消息
+
+#### 4.6.2 命令对象设计
+
+在 CQRS 模式中，命令对象表示用户执行的意图。创建用户的命令对象包含用户的基本信息：
+
+```csharp
+// Auth.Application/Features/CreateUser/CreateUserCommand.cs
+using MediatR;
+
+namespace Auth.Application.Features.CreateUser;
+
+public record CreateUserCommand : IRequest<IdResponse>, IAuditableAction
+{
+    public string Email { get; init; } = string.Empty;
+    public string FullName { get; init; } = string.Empty;
+    public string Password { get; init; } = string.Empty;
+    public string ConfirmPassword { get; init; } = string.Empty;
+    public List<string> RoleNames { get; init; } = new();
+    public int CreatedByUserId { get; set; }
+}
+
+public record IdResponse(int Id);
+```
+
+**命令对象设计要点**：
+
+- 使用 `record` 类型确保不可变性
+- 实现 `IRequest<TResponse>` 接口，符合 MediatR 规范
+- 实现 `IAuditableAction` 接口，支持审计跟踪
+- 使用初始化器属性，确保对象创建后不可修改
+- 提供默认值，避免空引用异常
+
+#### 4.6.3 验证器实现
+
+FluentValidation 验证器继承自 `AbstractValidator<T>`，并使用流畅的接口定义验证规则：
+
+```csharp
+// Auth.Application/Features/CreateUser/CreateUserCommandValidator.cs
+using FluentValidation;
+
+namespace Auth.Application.Features.CreateUser;
+
+public class CreateUserCommandValidator : AbstractValidator<CreateUserCommand>
+{
+    public CreateUserCommandValidator()
+    {
+        RuleFor(x => x.Email)
+            .NotEmpty().WithMessage("Email is required.")
+            .EmailAddress().WithMessage("Email must be a valid email address.")
+            .MaximumLength(256).WithMessage("Email must not exceed 256 characters.");
+
+        RuleFor(x => x.FullName)
+            .NotEmpty().WithMessage("Full name is required.")
+            .MinimumLength(2).WithMessage("Full name must be at least 2 characters.")
+            .MaximumLength(128).WithMessage("Full name must not exceed 128 characters.")
+            .Matches(@"^[a-zA-Z\s'-]+$").WithMessage("Full name can only contain letters, spaces, hyphens and apostrophes.");
+
+        RuleFor(x => x.Password)
+            .NotEmpty().WithMessage("Password is required.")
+            .MinimumLength(8).WithMessage("Password must be at least 8 characters.")
+            .MaximumLength(128).WithMessage("Password must not exceed 128 characters.")
+            .Matches(@"[A-Z]").WithMessage("Password must contain at least one uppercase letter.")
+            .Matches(@"[a-z]").WithMessage("Password must contain at least one lowercase letter.")
+            .Matches(@"[0-9]").WithMessage("Password must contain at least one digit.")
+            .Matches(@"[^a-zA-Z0-9]").WithMessage("Password must contain at least one special character.");
+
+        RuleFor(x => x.ConfirmPassword)
+            .NotEmpty().WithMessage("Confirm password is required.")
+            .Equal(x => x.Password).WithMessage("Passwords do not match.");
+
+        RuleFor(x => x.RoleNames)
+            .NotEmpty().WithMessage("At least one role must be assigned.")
+            .Must(x => x.All(role => !string.IsNullOrWhiteSpace(role)))
+                .WithMessage("Role names cannot be empty or whitespace.")
+            .Must(x => x.All(role => role.Length <= 64))
+                .WithMessage("Role names must not exceed 64 characters.");
+
+        RuleFor(x => x.CreatedByUserId)
+            .GreaterThan(0).WithMessage("Created by user ID must be greater than zero.");
+    }
+}
+```
+
+#### 4.6.4 验证规则详解
+
+**内置验证规则**
+
+1. **NotEmpty()**：验证字符串不为空或空白
+```csharp
+RuleFor(x => x.Email).NotEmpty().WithMessage("Email is required.");
+```
+
+2. **EmailAddress()**：验证邮箱地址格式
+```csharp
+RuleFor(x => x.Email).EmailAddress().WithMessage("Email must be a valid email address.");
+```
+
+3. **MaximumLength()**：验证字符串最大长度
+```csharp
+RuleFor(x => x.Email).MaximumLength(256).WithMessage("Email must not exceed 256 characters.");
+```
+
+4. **MinimumLength()**：验证字符串最小长度
+```csharp
+RuleFor(x => x.FullName).MinimumLength(2).WithMessage("Full name must be at least 2 characters.");
+```
+
+5. **Matches()**：使用正则表达式验证
+```csharp
+RuleFor(x => x.Password).Matches(@"[A-Z]").WithMessage("Password must contain at least one uppercase letter.");
+```
+
+6. **Equal()**：验证两个属性相等
+```csharp
+RuleFor(x => x.ConfirmPassword).Equal(x => x.Password).WithMessage("Passwords do not match.");
+```
+
+7. **GreaterThan()**：验证数值大于指定值
+```csharp
+RuleFor(x => x.CreatedByUserId).GreaterThan(0).WithMessage("Created by user ID must be greater than zero.");
+```
+
+**自定义验证规则**
+
+使用 `Must()` 方法实现自定义验证逻辑：
+
+```csharp
+RuleFor(x => x.Email)
+    .Must(BeUniqueEmail).WithMessage("Email already exists.");
+
+private bool BeUniqueEmail(string email)
+{
+    return !_userRepository.EmailExistsAsync(email).Result;
+}
+```
+
+**条件验证**
+
+使用 `When()` 方法实现条件验证：
+
+```csharp
+RuleFor(x => x.PhoneNumber)
+    .NotEmpty().WithMessage("Phone number is required.")
+    .Matches(@"^\+?[1-9]\d{1,14}$").WithMessage("Phone number must be a valid international phone number.")
+    .When(x => x.ReceiveSmsNotifications)
+    .WithMessage("Phone number is required when SMS notifications are enabled.");
+```
+
+**集合验证**
+
+验证集合中的每个元素：
+
+```csharp
+RuleFor(x => x.RoleNames)
+    .NotEmpty().WithMessage("At least one role must be assigned.")
+    .Must(roles => roles.All(role => !string.IsNullOrWhiteSpace(role)))
+        .WithMessage("Role names cannot be empty or whitespace.")
+    .Must(roles => roles.All(role => role.Length <= 64))
+        .WithMessage("Role names must not exceed 64 characters.");
+```
+
+#### 4.6.5 错误消息处理
+
+**自定义错误消息**
+
+使用 `WithMessage()` 方法提供自定义错误消息：
+
+```csharp
+RuleFor(x => x.Email)
+    .NotEmpty().WithMessage("Email is required.")
+    .EmailAddress().WithMessage("Email must be a valid email address.");
+```
+
+**参数化错误消息**
+
+使用 `{PropertyName}` 占位符在错误消息中引用属性名：
+
+```csharp
+RuleFor(x => x.Email)
+    .NotEmpty().WithMessage("{PropertyName} is required.")
+    .EmailAddress().WithMessage("{PropertyName} must be a valid email address.");
+```
+
+**多语言错误消息**
+
+使用 `WithLocalizedMessage()` 方法支持多语言：
+
+```csharp
+RuleFor(x => x.Email)
+    .NotEmpty().WithLocalizedMessage(() => Messages.EmailRequired)
+    .EmailAddress().WithLocalizedMessage(() => Messages.InvalidEmail);
+```
+
+#### 4.6.6 验证行为实现
+
+MediatR 管道行为用于在命令处理前自动执行验证：
+
+```csharp
+// BuildingBlocks.MediatR/ValidationBehavior.cs
+using FluentValidation;
+using MediatR;
+
+namespace BuildingBlocks.MediatR;
+
+public class ValidationBehavior<TRequest, TResponse>(IEnumerable<IValidator<TRequest>> validators)
+    : IPipelineBehavior<TRequest, TResponse>
+    where TRequest : notnull
+{
+    public async Task<TResponse> Handle(TRequest request, RequestHandlerDelegate<TResponse> next, CancellationToken cancellationToken)
+    {
+        if (!validators.Any())
+        {
+            return await next();
+        }
+
+        var context = new ValidationContext<TRequest>(request);
+        var validationResults = await Task.WhenAll(
+            validators.Select(v => v.ValidateAsync(context, cancellationToken)));
+
+        var failures = validationResults
+            .SelectMany(r => r.Errors)
+            .Where(f => f != null)
+            .ToList();
+
+        if (failures.Count != 0)
+        {
+            throw new ValidationException(failures);
+        }
+
+        return await next();
+    }
+}
+```
+
+#### 4.6.7 验证异常处理
+
+自定义验证异常类，用于统一处理验证错误：
+
+```csharp
+// BuildingBlocks.Exceptions/ValidationException.cs
+using FluentValidation.Results;
+
+namespace BuildingBlocks.Exceptions;
+
+public class ValidationException : Exception
+{
+    public IDictionary<string, string[]> Errors { get; }
+
+    public ValidationException() : base("One or more validation failures have occurred.")
+    {
+        Errors = new Dictionary<string, string[]>();
+    }
+
+    public ValidationException(IEnumerable<ValidationFailure> failures) : this()
+    {
+        Errors = failures
+            .GroupBy(e => e.PropertyName, e => e.ErrorMessage)
+            .ToDictionary(failureGroup => failureGroup.Key, failureGroup => failureGroup.ToArray());
+    }
+
+    public ValidationException(string propertyName, string errorMessage) : this()
+    {
+        Errors = new Dictionary<string, string[]>
+        {
+            { propertyName, new[] { errorMessage } }
+        };
+    }
+}
+```
+
+**全局异常处理中间件**
+
+```csharp
+// BuildingBlocks.AspNetCore/GlobalExceptionHandlerMiddleware.cs
+using Microsoft.AspNetCore.Mvc;
+
+namespace BuildingBlocks.AspNetCore;
+
+public class GlobalExceptionHandlerMiddleware(RequestDelegate next, ILogger<GlobalExceptionHandlerMiddleware> logger)
+{
+    public async Task InvokeAsync(HttpContext context)
+    {
+        try
+        {
+            await next(context);
+        }
+        catch (Exception ex)
+        {
+            await HandleExceptionAsync(context, ex);
+        }
+    }
+
+    private static async Task HandleExceptionAsync(HttpContext context, Exception exception)
+    {
+        context.Response.ContentType = "application/json";
+
+        var problemDetails = new ProblemDetails
+        {
+            Type = "https://tools.ietf.org/html/rfc7231#section-6.5.1",
+            Title = "One or more validation errors occurred.",
+            Status = StatusCodes.Status400BadRequest,
+            Detail = exception.Message
+        };
+
+        if (exception is ValidationException validationException)
+        {
+            problemDetails.Extensions["errors"] = validationException.Errors;
+        }
+
+        context.Response.StatusCode = problemDetails.Status.Value;
+        await context.Response.WriteAsJsonAsync(problemDetails);
+    }
+}
+```
+
+#### 4.6.8 注册验证服务
+
+在依赖注入配置中注册 FluentValidation 和验证行为：
+
+```csharp
+// Auth.Application/DependencyInjection.cs
+using FluentValidation;
+using MediatR;
+using Microsoft.Extensions.DependencyInjection;
+
+namespace Auth.Application;
+
+public static class DependencyInjection
+{
+    public static IServiceCollection AddApplication(this IServiceCollection services)
+    {
+        var assembly = typeof(DependencyInjection).Assembly;
+
+        services.AddMediatR(config =>
+        {
+            config.RegisterServicesFromAssembly(assembly);
+            config.AddOpenBehavior(typeof(ValidationBehavior<,>));
+            config.AddOpenBehavior(typeof(SetUserIdBehavior<,>));
+        });
+
+        services.AddValidatorsFromAssembly(assembly);
+
+        return services;
+    }
+}
+```
+
+#### 4.6.9 验证测试示例
+
+```csharp
+// Auth.Application.Tests/Features/CreateUser/CreateUserCommandValidatorTests.cs
+using FluentAssertions;
+using FluentValidation.TestHelper;
+using Xunit;
+
+namespace Auth.Application.Tests.Features.CreateUser;
+
+public class CreateUserCommandValidatorTests
+{
+    private readonly CreateUserCommandValidator _validator = new();
+
+    [Fact]
+    public void Should_Have_Error_When_Email_Is_Empty()
+    {
+        var command = new CreateUserCommand
+        {
+            Email = string.Empty,
+            FullName = "John Doe",
+            Password = "Password123!",
+            ConfirmPassword = "Password123!",
+            RoleNames = new List<string> { "User" }
+        };
+
+        var result = _validator.TestValidate(command);
+
+        result.ShouldHaveValidationErrorFor(x => x.Email)
+            .WithErrorMessage("Email is required.");
+    }
+
+    [Fact]
+    public void Should_Have_Error_When_Email_Is_Invalid()
+    {
+        var command = new CreateUserCommand
+        {
+            Email = "invalid-email",
+            FullName = "John Doe",
+            Password = "Password123!",
+            ConfirmPassword = "Password123!",
+            RoleNames = new List<string> { "User" }
+        };
+
+        var result = _validator.TestValidate(command);
+
+        result.ShouldHaveValidationErrorFor(x => x.Email)
+            .WithErrorMessage("Email must be a valid email address.");
+    }
+
+    [Fact]
+    public void Should_Have_Error_When_Password_Does_Not_Meet_Requirements()
+    {
+        var command = new CreateUserCommand
+        {
+            Email = "test@example.com",
+            FullName = "John Doe",
+            Password = "password",
+            ConfirmPassword = "password",
+            RoleNames = new List<string> { "User" }
+        };
+
+        var result = _validator.TestValidate(command);
+
+        result.ShouldHaveValidationErrorFor(x => x.Password)
+            .WithErrorMessage("Password must contain at least one uppercase letter.");
+
+        result.ShouldHaveValidationErrorFor(x => x.Password)
+            .WithErrorMessage("Password must contain at least one digit.");
+
+        result.ShouldHaveValidationErrorFor(x => x.Password)
+            .WithErrorMessage("Password must contain at least one special character.");
+    }
+
+    [Fact]
+    public void Should_Have_Error_When_Passwords_Do_Not_Match()
+    {
+        var command = new CreateUserCommand
+        {
+            Email = "test@example.com",
+            FullName = "John Doe",
+            Password = "Password123!",
+            ConfirmPassword = "Password456!",
+            RoleNames = new List<string> { "User" }
+        };
+
+        var result = _validator.TestValidate(command);
+
+        result.ShouldHaveValidationErrorFor(x => x.ConfirmPassword)
+            .WithErrorMessage("Passwords do not match.");
+    }
+
+    [Fact]
+    public void Should_Not_Have_Error_When_Command_Is_Valid()
+    {
+        var command = new CreateUserCommand
+        {
+            Email = "test@example.com",
+            FullName = "John Doe",
+            Password = "Password123!",
+            ConfirmPassword = "Password123!",
+            RoleNames = new List<string> { "User" }
+        };
+
+        var result = _validator.TestValidate(command);
+
+        result.ShouldNotHaveAnyValidationErrors();
+    }
+}
+```
+
+#### 4.6.10 设计优势
+
+- **早期验证**：在命令处理前进行验证，避免无效数据进入业务逻辑
+- **声明式验证**：使用声明式语法定义验证规则，提高代码可读性
+- **可维护性**：验证规则集中管理，易于维护和修改
+- **可测试性**：验证器易于单元测试
+- **一致性**：统一的验证逻辑确保数据一致性
+- **用户体验**：提供清晰的错误消息，改善用户体验
+- **性能优化**：在管道中早期失败，避免不必要的处理
+
+#### 4.6.11 最佳实践
+
+1. **验证规则分离**：将验证规则与业务逻辑分离
+2. **错误消息清晰**：提供清晰、具体的错误消息
+3. **验证器命名**：使用 `CommandNameValidator` 命名约定
+4. **组合验证器**：对于复杂对象，使用组合验证器
+5. **自定义验证**：对于复杂业务规则，使用自定义验证
+6. **测试覆盖**：为验证器编写全面的单元测试
+7. **性能考虑**：避免在验证器中进行数据库查询
+8. **国际化**：支持多语言错误消息
+
+### 4.7 创建用户:基于DDD原则实现用户聚合
+
+本节将详细介绍如何基于领域驱动设计（DDD）原则实现用户聚合，包括聚合根、值对象、领域事件等核心概念的具体实现。
+
+#### 4.7.1 用户聚合根设计
+
+用户聚合根是认证上下文的核心，负责维护用户数据的完整性和一致性。聚合根设计遵循以下原则：
+
+1. **单一入口点**：所有对用户聚合的访问都必须通过聚合根
+2. **一致性边界**：聚合根确保内部对象状态的一致性
+3. **业务规则封装**：所有业务逻辑都封装在聚合根内部
+
+**用户聚合根实现**：
+
+```csharp
+// Auth.Domain/Users/User.cs
+public partial class User : IdentityUser<int>, IEntity
+{
+    public required string Name { get; set; }
+    public required Gender Gender { get; set; }
+    public HonorificTitle? Honorific { get; set; }
+    public string? Position { get; set; }
+    public string? CompanyName { get; set; }
+    public string? Affiliation { get; set; }
+    public ProfessionalProfile? ProfessionalProfile { get; set; }
+    public string? PictureUrl { get; set; }
+    public DateTime RegistrationDate { get; set; } = DateTime.UtcNow;
+    public DateTime? LastLogin { get; set; }
+
+    private List<UserRole> _userRoles = [];
+    public virtual IReadOnlyList<UserRole> UserRoles => _userRoles;
+
+    private List<RefreshToken> _refreshTokens = [];
+    public virtual List<RefreshToken> RefreshTokens => _refreshTokens;
+}
+```
+
+#### 4.7.2 工厂方法模式创建用户
+
+使用工厂方法模式确保用户创建过程的业务规则得到强制执行：
+
+```csharp
+// Auth.Domain/Users/Behaviors/User.cs
+public partial class User
+{
+    public static User Create(IUserCreationInfo userCreationInfo)
+    {
+        if (userCreationInfo.UserRoles is not { Count: > 0 })
+            throw new ArgumentException("User must have at least one role.", nameof(userCreationInfo.UserRoles));
+
+        var user = new User
+        {
+            UserName = userCreationInfo.Email,
+            Email = userCreationInfo.Email,
+            Name = userCreationInfo.Name,
+            Gender = userCreationInfo.Gender,
+            PhoneNumber = userCreationInfo.PhoneNumber,
+            PictureUrl = userCreationInfo.PictureUrl,
+            Honorific = HonorificTitle.FromEnum(userCreationInfo.Honorific),
+            ProfessionalProfile = ProfessionalProfile.Create(
+                userCreationInfo.Position,
+                userCreationInfo.CompanyName,
+                userCreationInfo.Affiliation
+            ),
+            _userRoles = userCreationInfo.UserRoles
+                .Select(x => UserRole.Create(x))
+                .ToList(),
+        };
+
+        return user;
+    }
+}
+```
+
+#### 4.7.3 值对象设计
+
+值对象用于表示没有唯一标识的领域概念，确保不可变性和值相等性：
+
+**专业档案值对象**：
+
+```csharp
+// Auth.Domain/Users/ValueObjects/ProfessionalProfile.cs
+public class ProfessionalProfile : ValueObject
+{
+    public string? Position { get; private set; }
+    public string? CompanyName { get; private set; }
+    public string? Affiliation { get; private set; }
+
+    private ProfessionalProfile() { }
+
+    public static ProfessionalProfile Create(string? position, string? companyName, string? affiliation)
+    {
+        return new ProfessionalProfile
+        {
+            Position = position,
+            CompanyName = companyName,
+            Affiliation = affiliation
+        };
+    }
+
+    protected override IEnumerable<object?> GetEqualityComponents()
+    {
+        yield return Position;
+        yield return CompanyName;
+        yield return Affiliation;
+    }
+}
+```
+
+**尊称值对象**：
+
+```csharp
+// Auth.Domain/Users/ValueObjects/HonorificTitle.cs
+public class HonorificTitle : ValueObject
+{
+    public string? Title { get; private set; }
+    public Honorific? Honorific { get; private set; }
+
+    private HonorificTitle() { }
+
+    public static HonorificTitle? FromEnum(Honorific? honorific)
+    {
+        if (honorific == null) return null;
+
+        return new HonorificTitle
+        {
+            Honorific = honorific,
+            Title = honorific switch
+            {
+                Honorific.Mr => "Mr.",
+                Honorific.Mrs => "Mrs.",
+                Honorific.Ms => "Ms.",
+                Honorific.Dr => "Dr.",
+                Honorific.Prof => "Prof.",
+                _ => null
+            }
+        };
+    }
+
+    protected override IEnumerable<object?> GetEqualityComponents()
+    {
+        yield return Title;
+        yield return Honorific;
+    }
+}
+```
+
+#### 4.7.4 领域事件实现
+
+领域事件用于表示聚合内部发生的重要业务变化：
+
+```csharp
+// Auth.Domain/Users/Events/UserCreated.cs
+public class UserCreated : DomainEvent
+{
+    public int UserId { get; }
+    public string Email { get; }
+    public string Name { get; }
+
+    public UserCreated(int userId, string email, string name)
+    {
+        UserId = userId;
+        Email = email;
+        Name = name;
+    }
+}
+```
+
+#### 4.7.5 用户角色实体
+
+用户角色实体表示用户与角色之间的关联关系：
+
+```csharp
+// Auth.Domain/Users/UserRole.cs
+public class UserRole : Entity
+{
+    public int UserId { get; private set; }
+    public UserRoleType Type { get; private set; }
+    public DateTime? StartDate { get; private set; }
+    public DateTime? ExpiringDate { get; private set; }
+
+    public virtual User User { get; private set; } = null!;
+
+    private UserRole() { }
+
+    public static UserRole Create(IUserRole userRole)
+    {
+        return new UserRole
+        {
+            Type = userRole.Type,
+            StartDate = userRole.StartDate,
+            ExpiringDate = userRole.ExpiringDate
+        };
+    }
+}
+```
+
+#### 4.7.6 DDD聚合设计最佳实践
+
+1. **聚合边界明确**：用户聚合包含用户基本信息、角色和刷新令牌
+2. **业务规则内聚**：所有用户相关的业务规则都封装在聚合内部
+3. **不变性保护**：通过私有setter和工厂方法保护聚合状态
+4. **事件驱动**：重要状态变化通过领域事件通知外部系统
+5. **值对象使用**：将相关属性组合成值对象，提高代码可读性
+
+#### 4.7.7 聚合根接口设计
+
+```csharp
+// BuildingBlocks/Domain/IAggregateRoot.cs
+public interface IAggregateRoot
+{
+    IReadOnlyCollection<DomainEvent> DomainEvents { get; }
+    void ClearDomainEvents();
+}
+```
+
+通过以上设计，我们实现了符合DDD原则的用户聚合，确保了业务逻辑的完整性和数据的一致性。
+
+### 4.8 创建用户:用EFCore和SQLServer实现持久层
+
+本节将详细介绍如何使用EF Core和SQL Server实现用户聚合的持久化层，包括DbContext配置、实体映射、仓储模式和数据访问实现。
+
+#### 4.8.1 AuthDbContext设计
+
+认证上下文的DbContext负责管理用户相关的实体和关系：
+
+```csharp
+// Auth.Persistence/AuthDbContext.cs
+public class AuthDbContext : IdentityDbContext<User, IdentityRole<int>, int>
+{
+    public AuthDbContext(DbContextOptions<AuthDbContext> options) : base(options) { }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+        
+        // 应用实体配置
+        builder.ApplyConfigurationsFromAssembly(Assembly.GetExecutingAssembly());
+        
+        // 配置用户实体
+        builder.Entity<User>(entity =>
+        {
+            // 配置复杂属性
+            entity.ComplexProperty(e => e.ProfessionalProfile, profile =>
+            {
+                profile.Property(p => p.Position).HasMaxLength(100);
+                profile.Property(p => p.CompanyName).HasMaxLength(200);
+                profile.Property(p => p.Affiliation).HasMaxLength(200);
+            });
+            
+            // 配置索引
+            entity.HasIndex(e => e.Email).IsUnique();
+            entity.HasIndex(e => e.RegistrationDate);
+            
+            // 配置关系
+            entity.HasMany(e => e.UserRoles)
+                .WithOne(e => e.User)
+                .HasForeignKey(e => e.UserId)
+                .IsRequired();
+                
+            entity.HasMany(e => e.RefreshTokens)
+                .WithOne()
+                .HasForeignKey(e => e.UserId)
+                .IsRequired();
+        });
+    }
+}
+```
+
+#### 4.8.2 实体配置类
+
+使用实体配置类分离数据库映射逻辑，保持DbContext的简洁性：
+
+```csharp
+// Auth.Persistence/EntityConfigurations/UserEntityConfiguration.cs
+public class UserEntityConfiguration : IEntityTypeConfiguration<User>
+{
+    public void Configure(EntityTypeBuilder<User> builder)
+    {
+        // 配置表名
+        builder.ToTable("Users");
+        
+        // 配置主键
+        builder.HasKey(u => u.Id);
+        
+        // 配置属性
+        builder.Property(u => u.Name)
+            .HasMaxLength(100)
+            .IsRequired();
+            
+        builder.Property(u => u.Email)
+            .HasMaxLength(256)
+            .IsRequired();
+            
+        builder.Property(u => u.Gender)
+            .HasConversion<string>()
+            .HasMaxLength(10);
+            
+        builder.Property(u => u.RegistrationDate)
+            .IsRequired();
+            
+        builder.Property(u => u.LastLogin);
+        
+        // 配置复杂属性
+        builder.ComplexProperty(u => u.ProfessionalProfile, profile =>
+        {
+            profile.Property(p => p.Position).HasMaxLength(100);
+            profile.Property(p => p.CompanyName).HasMaxLength(200);
+            profile.Property(p => p.Affiliation).HasMaxLength(200);
+        });
+        
+        // 配置导航属性
+        builder.HasMany(u => u.UserRoles)
+            .WithOne(ur => ur.User)
+            .HasForeignKey(ur => ur.UserId)
+            .IsRequired();
+            
+        builder.HasMany(u => u.RefreshTokens)
+            .WithOne()
+            .HasForeignKey(rt => rt.UserId)
+            .IsRequired();
+    }
+}
+```
+
+#### 4.8.3 依赖注入配置
+
+在Program.cs中配置EF Core和SQL Server连接：
+
+```csharp
+// Auth.Persistence/DependencyInjection.cs
+public static class DependencyInjection
+{
+    public static IServiceCollection AddPersistenceServices(
+        this IServiceCollection services, IConfiguration configuration)
+    {
+        var connectionString = configuration.GetConnectionString("Database");
+        
+        services.AddDbContext<AuthDbContext>(options =>
+            options.UseSqlServer(connectionString));
+        
+        return services;
+    }    
+}
+```
+
+#### 4.8.4 ASP.NET Core Identity集成
+
+集成ASP.NET Core Identity提供用户管理和认证功能：
+
+```csharp
+// Auth.API/Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services
+    .AddIdentity<User, IdentityRole<int>>(options =>
+    {
+        // 密码策略
+        options.Password.RequiredLength = 8;
+        options.Password.RequireDigit = true;
+        options.Password.RequireLowercase = true;
+        options.Password.RequireUppercase = true;
+        options.Password.RequireNonAlphanumeric = true;
+        
+        // 用户策略
+        options.User.RequireUniqueEmail = true;
+        options.SignIn.RequireConfirmedEmail = true;
+    })
+    .AddEntityFrameworkStores<AuthDbContext>()
+    .AddDefaultTokenProviders();
+```
+
+#### 4.8.5 仓储模式实现
+
+使用通用仓储模式提供数据访问抽象层：
+
+```csharp
+// BuildingBlocks.EntityFramework/Repository.cs
+public class Repository<TContext, TEntity> : IRepository<TEntity>
+    where TContext : DbContext
+    where TEntity : class, IEntity<int>
+{
+    public readonly TContext Context;
+    protected readonly DbSet<TEntity> DbSet;
+
+    public Repository(TContext context)
+    {
+        Context = context;
+        DbSet = Context.Set<TEntity>();
+    }
+
+    public virtual Task<TEntity?> GetByIdAsync(int id)
+        => Query().SingleOrDefaultAsync(x => x.Id == id);
+
+    public virtual async Task<TEntity> AddAsync(TEntity entity)
+        => (await DbSet.AddAsync(entity)).Entity;
+
+    public virtual TEntity Update(TEntity entity)
+        => DbSet.Update(entity).Entity;
+
+    public virtual void Remove(TEntity entity)
+        => DbSet.Remove(entity);
+
+    public async Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
+        => await Context.SaveChangesAsync(cancellationToken);
+}
+```
+
+#### 4.8.6 数据库迁移
+
+使用EF Core迁移管理数据库架构变更：
+
+```bash
+# 创建迁移
+dotnet ef migrations add InitialCreate --project Auth.Persistence --startup-project Auth.API
+
+# 应用迁移
+dotnet ef database update --project Auth.Persistence --startup-project Auth.API
+```
+
+#### 4.8.7 性能优化策略
+
+1. **索引优化**：为频繁查询的字段添加索引
+2. **查询优化**：使用AsNoTracking()避免变更跟踪
+3. **连接池**：配置SQL Server连接池
+4. **批量操作**：使用批量插入和更新
+5. **缓存策略**：实现缓存层减少数据库访问
+
+### 4.9 创建用户:用Identity和FastEndpoints实现命令处理器
+
+本节将详细介绍如何使用ASP.NET Core Identity和FastEndpoints实现创建用户的命令处理器，包括端点设计、验证、业务逻辑和响应处理。
+
+#### 4.9.1 FastEndpoints端点设计
+
+使用FastEndpoints创建简洁高效的API端点：
+
+```csharp
+// Auth.API/Features/CreateUser/CreateUserEndpoint.cs
+[Authorize(Roles = Role.USERADMIN)]
+[HttpPost("users")]
+public class CreateUserEndpoint(UserManager<User> userManager) 
+    : Endpoint<CreateUserCommand, CreateUserResponse>
+{
+    public override async Task HandleAsync(CreateUserCommand req, CancellationToken ct)
+    {
+        // 检查用户是否已存在
+        var user = await userManager.FindByEmailAsync(req.Email);
+        if (user is not null)
+            throw new BadRequestException($"User with email {req.Email} already exists.");
+
+        // 使用工厂方法创建用户聚合
+        user = Domain.Users.User.Create(req);
+
+        // 使用Identity创建用户
+        var result = await userManager.CreateAsync(user);
+        if (!result.Succeeded)
+        {
+            var errorMessages = string.Join(" | ", result.Errors.Select(e => $"{e.Code}: {e.Description}"));
+            throw new BadRequestException($"Unable to create user {req.Email} with {errorMessages}");
+        }
+
+        // 生成密码重置令牌
+        var resetToken = await userManager.GeneratePasswordResetTokenAsync(user);
+
+        // 发布领域事件
+        await PublishAsync(new UserCreated(user, resetToken));
+
+        // 返回响应
+        Response = new CreateUserResponse(req.Email, user.Id, resetToken);
+    }
+}
+```
+
+#### 4.9.2 命令对象设计
+
+定义创建用户的命令对象：
+
+```csharp
+// Auth.API/Features/CreateUser/CreateUserCommand.cs
+public class CreateUserCommand : IUserCreationInfo
+{
+    public required string Email { get; set; }
+    public required string Name { get; set; }
+    public required Gender Gender { get; set; }
+    public Honorific? Honorific { get; set; }
+    public string? PhoneNumber { get; set; }
+    public string? PictureUrl { get; set; }
+    public string? CompanyName { get; set; }
+    public string? Position { get; set; }
+    public string? Affiliation { get; set; }
+
+    public required IReadOnlyList<UserRoleDto> UserRoles { get; init; } = [];
+
+    IReadOnlyList<IUserRole> IUserCreationInfo.UserRoles => UserRoles;
+}
+
+public record UserRoleDto(UserRoleType Type, DateTime? StartDate, DateTime? ExpiringDate) : IUserRole;
+```
+
+#### 4.9.3 验证器实现
+
+使用FluentValidation实现命令验证：
+
+```csharp
+// Auth.API/Features/CreateUser/CreateUserCommandValidator.cs
+public class CreateUserCommandValidator : Validator<CreateUserCommand>
+{
+    public CreateUserCommandValidator()
+    {
+        RuleFor(x => x.Name).NotEmpty();
+
+        RuleFor(x => x.Email).NotEmpty()
+            .EmailAddress();
+
+        RuleFor(x => x.UserRoles).NotEmpty()
+            .Must((c, roles) => AreUserRoleDatesValid(roles))
+            .WithMessage("Invalid roles");
+    }
+
+    private static bool AreUserRoleDatesValid(IReadOnlyList<UserRoleDto> roles)
+    {
+        return roles.All(x =>
+            (!x.StartDate.HasValue || x.StartDate.Value.Date >= DateTime.UtcNow)
+            &&
+            (!x.ExpiringDate.HasValue || (x.StartDate ?? DateTime.UtcNow).Date < x.ExpiringDate.Value.Date)
+        );
+    }
+}
+```
+
+#### 4.9.4 响应对象设计
+
+定义创建用户的响应对象：
+
+```csharp
+// Auth.API/Features/CreateUser/CreateUserResponse.cs
+public record CreateUserResponse(string Email, int UserId, string Token);
+```
+
+#### 4.9.5 领域事件处理
+
+处理用户创建后的领域事件：
+
+```csharp
+// Auth.Application/Events/UserCreatedEventHandler.cs
+public class UserCreatedEventHandler(
+    IEmailService emailService,
+    ILogger<UserCreatedEventHandler> logger) 
+    : INotificationHandler<UserCreatedEvent>
+{
+    public async Task Handle(UserCreatedEvent notification, CancellationToken cancellationToken)
+    {
+        logger.LogInformation("Handling UserCreatedEvent for user {UserId}", notification.UserId);
+
+        var confirmationLink = GenerateConfirmationLink(notification.UserId, notification.Token);
+        await emailService.SendEmailConfirmationAsync(
+            notification.Email,
+            confirmationLink,
+            cancellationToken);
+
+        logger.LogInformation("Confirmation email sent to {Email}", notification.Email);
+    }
+
+    private static string GenerateConfirmationLink(int userId, string token)
+    {
+        return $"https://auth.yourdomain.com/confirm-email?userId={userId}&token={token}";
+    }
+}
+```
+
+#### 4.9.6 错误处理策略
+
+1. **验证错误**：在验证器中捕获并返回详细错误信息
+2. **业务错误**：使用自定义异常和异常中间件处理
+3. **数据库错误**：使用重试策略和连接恢复机制
+4. **网络错误**：实现超时和重试机制
+
+#### 4.9.7 安全考虑
+
+1. **授权检查**：使用[Authorize]属性保护端点
+2. **输入验证**：防止SQL注入和XSS攻击
+3. **数据加密**：敏感数据在传输和存储时加密
+4. **审计日志**：记录所有用户创建操作
+
+#### 4.9.8 性能优化
+
+1. **异步操作**：所有数据库操作都使用异步方法
+2. **批量处理**：支持批量用户创建
+3. **缓存策略**：缓存用户查询结果
+4. **连接复用**：使用连接池减少连接开销
+
+通过以上设计，我们实现了高效、安全、可扩展的用户创建功能，结合了DDD、CQRS和垂直切片架构的最佳实践。
+
+### 4.10 实现邮件服务模块
+
+邮件服务模块为系统提供邮件发送功能，支持用户注册确认、密码重置等关键业务流程。
+
+#### 4.10.1 邮件服务接口设计
+
+定义统一的邮件服务接口，支持不同类型的邮件发送：
+
+```csharp
+// EmailService.Contracts/IEmailService.cs
+public interface IEmailService
+{
+    Task<bool> SendEmailAsync(EmailMessage emailMessage, CancellationToken cancellationToken);
+    Task SendEmailConfirmationAsync(string email, string confirmationLink, CancellationToken cancellationToken);
+}
+```
+
+#### 4.10.2 SMTP邮件服务实现
+
+使用MailKit库实现SMTP邮件发送功能：
+
+```csharp
+// EmailService.Smtp/SmtpEmailService.cs
+public class SmtpEmailService : IEmailService
+{
+    public async Task<bool> SendEmailAsync(EmailMessage emailMessage, CancellationToken cancellationToken)
+    {
+        var message = emailMessage.ToMailKitMessage();
+        
+        using var smtpClient = new SmtpClient();
+        await smtpClient.ConnectAsync(
+            _emailOptions.Smtp.Host,
+            _emailOptions.Smtp.Port,
+            _emailOptions.Smtp.UseSSL,
+            cancellationToken
+        );
+        
+        await smtpClient.AuthenticateAsync(
+            _emailOptions.Smtp.Username,
+            _emailOptions.Smtp.Password,
+            cancellationToken
+        );
+        
+        await smtpClient.SendAsync(message, cancellationToken);
+        return true;
+    }
+}
+```
+
+#### 4.10.3 邮件配置选项
+
+支持灵活的邮件配置，包括SMTP服务器设置：
+
+```csharp
+// EmailService.Smtp/EmailOptions.cs
+public class EmailOptions
+{
+    [Required]
+    public string EmailServiceProvider { get; init; }
+    [Required]
+    public string EmailFromAddress { get; init; }
+    [Required]
+    public Smtp Smtp { get; set; }
+}
+
+public class Smtp
+{
+    [Required]
+    public string Host { get; init; }
+    [Required]
+    public int Port { get; init; }
+    [Required]
+    public string Username { get; init; }
+    [Required]
+    public string Password { get; init; }
+    public bool UseSSL { get; set; } = true;
+}
+```
+
+#### 4.10.4 邮件服务注册
+
+使用依赖注入注册邮件服务：
+
+```csharp
+// EmailService.Smtp/MailServiceRegistration.cs
+public static class MailServiceRegistration
+{
+    public static IServiceCollection AddSmtpEmailService(this IServiceCollection services, IConfiguration configuration)
+    {
+        services.AddAndValidateOptions<EmailOptions>(configuration);
+        services.AddSingleton<IEmailService, SmtpEmailService>();
+        return services;    
+    }
+}
+```
+
+### 4.11 创建用户:用FastEndpoints实现确认邮件
+
+#### 4.11.1 用户创建事件处理器
+
+当用户创建成功后，自动发送确认邮件：
+
+```csharp
+// Auth.API/Features/CreateUser/SendConfirmationEmailOnUserCreatedHandler.cs
+public class SendConfirmationEmailOnUserCreatedHandler : IEventHandler<UserCreated>
+{
+    public async Task HandleAsync(UserCreated eventModel, CancellationToken ct)
+    {
+        var url = httpContextAccessor.HttpContext?.Request.BaseUrl()
+            .AppendPathSegment("password")
+            .SetQueryParams(new { eventModel.ResetToken });
+
+        var emailMessage = buildConfirmationEmail(eventModel.User, url, emailOptions.Value.EmailFromAddress);
+        await emailService.SendEmailAsync(emailMessage, ct);
+    }
+
+    private EmailMessage buildConfirmationEmail(User user, string resetLink, string fromEmailAddress)
+    {
+        const string confirmationEmail = 
+            "Dear {0},<br/>An account has been created for you.<br/>Please set your password using the following URL: <br/>{1}";
+        return new EmailMessage(
+            "Your Account Has Been Created - Set Your Password",
+            new Content(ContentType.Html, string.Format(confirmationEmail, user.Name, resetLink)),
+            new EmailAddress("Articles", fromEmailAddress),
+            [new EmailAddress(user.Name, user.Email)]);
+    }
+}
+```
+
+#### 4.11.2 邮件确认链接生成
+
+生成安全的密码设置链接：
+
+```csharp
+private static string GenerateConfirmationLink(int userId, string token)
+{
+    return $"https://auth.yourdomain.com/confirm-email?userId={userId}&token={token}";
+}
+```
+
+### 4.12 添加依赖注入配置与模块
+
+#### 4.12.1 API层依赖注入配置
+
+在API层统一配置所有依赖服务：
+
+```csharp
+// Auth.API/DependencyInjection.cs
+public static class DependencyInjection
+{
+    public static IServiceCollection AddApiServices(this IServiceCollection services, IConfiguration configuration)
+    {
+        services.AddAndValidateOptions<EmailOptions>(configuration);
+        
+        services
+            .AddFastEndpoints()
+            .AddSwaggerDocument()
+            .AddEndpointsApiExplorer()
+            .AddSwaggerGen()
+            .AddJwtIdentity(configuration);
+
+        services.AddSmtpEmailService(configuration);
+        return services;
+    }
+
+    public static IServiceCollection AddJwtIdentity(this IServiceCollection services, IConfiguration configuration)
+    {
+        services.AddIdentityCore<User>(options =>
+        {
+            options.Lockout.AllowedForNewUsers = true;
+            options.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(5);
+            options.Lockout.MaxFailedAccessAttempts = 5;
+        }).AddRoles<Role>()
+        .AddEntityFrameworkStores<AuthDbContext>()
+        .AddSignInManager<SignInManager<User>>()
+        .AddDefaultTokenProviders();
+
+        services.Configure<IdentityOptions>(options =>
+        {
+            options.ClaimsIdentity.RoleClaimType = ClaimTypes.Role;
+        });
+        return services;
+    }
+}
+```
+
+#### 4.12.2 应用层配置
+
+应用层服务注册：
+
+```csharp
+// Auth.Application/DependencyInjection.cs
+public static class DependencyInjection
+{
+    public static IServiceCollection AddApplicationServices(this IServiceCollection services)
+    {
+        services.AddMediatR(cfg => 
+            cfg.RegisterServicesFromAssembly(Assembly.GetExecutingAssembly()));
+        
+        services.AddScoped<TokenFactory>();
+        services.AddScoped<IUserRepository, UserRepository>();
+        
+        return services;
+    }
+}
+```
+
+### 4.13 登录:用FluentValidation实现命令与逻辑
+
+#### 4.13.1 登录命令验证器
+
+使用FluentValidation验证登录命令的合法性：
+
+```csharp
+// Auth.API/Features/Login/LoginCommandValidator.cs
+public class LoginCommandValidator : Validator<LoginCommand>
+{
+    public LoginCommandValidator()
+    {
+        RuleFor(x => x.Email)
+            .NotEmpty()
+            .EmailAddress();
+
+        RuleFor(x => x.Password).NotEmpty();
+    }    
+}
+```
+
+#### 4.13.2 登录命令对象
+
+定义登录命令的数据结构：
+
+```csharp
+// Auth.API/Features/Login/LoginCommand.cs
+public record LoginCommand(string Email, string Password);
+
+public record LoginResponse(string Email, string AccessToken, string RefreshToken);
+```
+
+### 4.14 登录:用Identity和FastEndpoints实现命令与逻辑
+
+#### 4.14.1 登录端点实现
+
+使用FastEndpoints和ASP.NET Core Identity实现登录功能：
+
+```csharp
+// Auth.API/Features/Login/LoginEndpoint.cs
+[AllowAnonymous]
+[HttpPost("login")]
+public class LoginEndpoint : Endpoint<LoginCommand, LoginResponse>
+{
+    public override async Task HandleAsync(LoginCommand req, CancellationToken ct)
+    {
+        var user = await userManager.FindByEmailAsync(req.Email);
+        if (user is null)
+            throw new BadRequestException($"User {req.Email} not found");
+
+        var result = await signInManager.CheckPasswordSignInAsync(user, req.Password, false);
+        if (!result.Succeeded)
+            throw new BadRequestException($"Invalid credentials for user {req.Email}");
+
+        var userRoles = await userManager.GetRolesAsync(user);
+        var jwtToken = tokenFactory.GenerateAccessToken(user.Id.ToString(), user.Name, req.Email, userRoles, Array.Empty<Claim>());
+        var refreshToken = tokenFactory.GenerateRefreshToken(HttpContext.GetClientIpAddress());
+
+        user.AddRefreshToken(refreshToken);
+        await userManager.UpdateAsync(user);
+
+        await Send.OkAsync(new LoginResponse(req.Email, jwtToken, refreshToken.Token));
+    }
+}
+```
+
+#### 4.14.2 登录流程
+
+1. **用户验证**：通过Email查找用户，验证密码
+2. **角色获取**：获取用户的角色信息
+3. **令牌生成**：生成访问令牌和刷新令牌
+4. **令牌持久化**：将刷新令牌保存到数据库
+5. **响应返回**：返回登录结果和令牌信息
+
+### 4.15 登录:生成令牌与刷新令牌并持久化
+
+#### 4.15.1 令牌工厂实现
+
+使用JWT标准生成安全的访问令牌：
+
+```csharp
+// Auth.Application/TokenFactory.cs
+public class TokenFactory
+{
+    public string GenerateAccessToken(string userId, string fullName, string email,
+        IEnumerable<string> roles, IEnumerable<Claim> additionalClaims)
+    {
+        var claims = new[]
+            {
+                new Claim(JwtRegisteredClaimNames.Sub, userId),
+                new Claim(JwtRegisteredClaimNames.Email, email),
+                new Claim(JwtRegisteredClaimNames.Jti, Guid.NewGuid().ToString()),
+                new Claim(ClaimTypes.NameIdentifier, userId),
+                new Claim(ClaimTypes.Name, fullName),
+                new Claim(ClaimTypes.Email, email),
+            }
+            .Concat(roles.Select(x => new Claim(ClaimTypes.Role, x)))
+            .Concat(additionalClaims);
+
+        var secretKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtOptions.Secret));
+        var signingCredentials = new SigningCredentials(secretKey, SecurityAlgorithms.HmacSha256);
+
+        var jwtToken = new JwtSecurityToken(
+            issuer: _jwtOptions.Issuer,
+            audience: _jwtOptions.Audience,
+            notBefore: DateTime.UtcNow,
+            expires: _jwtOptions.Expiration,
+            claims: claims,
+            signingCredentials: signingCredentials);
+
+        return new JwtSecurityTokenHandler().WriteToken(jwtToken);
+    }
+}
+```
+
+#### 4.15.2 刷新令牌生成
+
+生成安全的刷新令牌并关联用户：
+
+```csharp
+public RefreshToken GenerateRefreshToken(string ipAddress)
+{
+    return new RefreshToken
+    {
+        Token = RandomTokenString(),
+        Expires = DateTime.UtcNow.AddDays(7),
+        Created = DateTime.UtcNow,
+        CreatedByIp = ipAddress
+    };
+}
+
+private static string RandomTokenString()
+{
+    using var rngCryptoServiceProvider = RandomNumberGenerator.Create();
+    var randomBytes = new byte[40];
+    rngCryptoServiceProvider.GetBytes(randomBytes);
+    return BitConverter.ToString(randomBytes).Replace("-", "");
+}
+```
+
+#### 4.15.3 刷新令牌持久化
+
+将刷新令牌保存到用户实体中：
+
+```csharp
+// Auth.Domain/Users/User.cs
+public partial class User : IdentityUser<int>, IEntity
+{
+    private List<RefreshToken> _refreshTokens = [];
+    public virtual List<RefreshToken> RefreshTokens => _refreshTokens;
+
+    public void AddRefreshToken(RefreshToken refreshToken)
+    {
+        _refreshTokens.Add(refreshToken);
+    }
+}
+```
+
+#### 4.15.4 令牌安全策略
+
+1. **访问令牌**：有效期15分钟，包含用户身份和权限信息
+2. **刷新令牌**：有效期7天，仅用于获取新的访问令牌
+3. **令牌撤销**：支持主动撤销刷新令牌
+4. **安全存储**：刷新令牌存储在HttpOnly Cookie中防止XSS攻击
+
+通过以上实现，我们构建了完整的认证授权系统，支持安全的用户登录、令牌管理和邮件确认功能。
+

@@ -1,4 +1,5 @@
 ﻿using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
@@ -30,4 +31,8 @@ public static class BuilderExtensions
             x => deserializeFunc(x)
         );
     }
+
+    public static PropertyBuilder<TProperty> HasColumnNameSameAsProperty<TProperty>(
+        this PropertyBuilder<TProperty> builder)
+        => builder.HasColumnName(builder.Metadata.PropertyInfo?.Name);
 }
